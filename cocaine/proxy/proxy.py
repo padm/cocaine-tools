@@ -33,9 +33,9 @@ from tornado import ioloop
 
 from cocaine.services import Service
 from cocaine.exceptions import ServiceError
+from cocaine.asio.exceptions import TimeoutError
 from cocaine.exceptions import ChokeEvent
 from cocaine.futures import chain
-
 
 RECONNECT_START = "Start asynchronous reconnect %s"
 RECONNECT_SUCCESS = "Reconnect %s %d to %s successfully."
@@ -76,7 +76,7 @@ class CocaineProxy(object):
         return ioloop.IOLoop.current()
 
     def get_timeout(self, name):
-        return self.timeouts.get(name, DEFAULT_TIMEOUT)
+        return self.timeouts.get(name) or self.timeouts.get("default") or DEFAULT_TIMEOUT
 
     def async_reconnect(self, app, name):
         def callback(res):
@@ -168,7 +168,7 @@ class CocaineProxy(object):
     def process(self, obj, service, event, data):
         message_parts = []
         try:
-            chunk = yield service.enqueue(event, msgpack.packb(data))
+            chunk = yield service.enqueue(event, msgpack.packb(data), timeout=self.get_timeout(service.name))
             while True:
                 body = yield
                 message_parts.append(str(body))
@@ -188,6 +188,15 @@ class CocaineProxy(object):
         except ServiceError as err:
             self.logger.error(str(err))
             message = "Application error: %s" % str(err)
+            response_data = self.TEMPLATE % {
+                "VERSION": obj.version,
+                "CODE": 502,
+                "STATUS": httplib.responses[502],
+                "HEADERS": 'Content-Length: %d\r\n' % len(message),
+                "BODY": message}
+        except TimeoutError as err:
+            self.logger.error("Application %s timeout %s", service.name, str(err))
+            message = "Application %s timeout: %s" % (service.name, str(err))
             response_data = self.TEMPLATE % {
                 "VERSION": obj.version,
                 "CODE": 502,
@@ -232,35 +241,40 @@ class CocaineProxy(object):
         return msg
 
     def handle_request(self, request):
-        match = URL_REGEX.match(request.uri)
+        if "X-Cocaine-Service" in request.headers and "X-Cocaine-Event" in request.headers:
+            self.logger.debug('Dispatch by headers')
+            name = request.headers['X-Cocaine-Service']
+            event = request.headers['X-Cocaine-Event']
+        else:
+            match = URL_REGEX.match(request.uri)
 
-        if match is None:
-            if request.path == "/info":
-                message = self.generate_info()
-                request.write("%s 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (
+            if match is None:
+                if request.path == "/info":
+                    message = self.generate_info()
+                    request.write("%s 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (
+                        request.version, len(message), message))
+                    request.finish()
+                    return
+
+                message = "Invalid url"
+                request.write("%s 404 Not found\r\nContent-Length: %d\r\n\r\n%s" % (
                     request.version, len(message), message))
                 request.finish()
                 return
 
-            message = "Invalid url"
-            request.write("%s 404 Not found\r\nContent-Length: %d\r\n\r\n%s" % (
-                request.version, len(message), message))
-            request.finish()
-            return
+            name, event, other = match.groups()
+            if name == '' or event == '':
+                message = "Invalid request"
+                request.write("%s 404 Not found\r\nContent-Length: %d\r\n\r\n%s" % (
+                    request.version, len(message), message))
+                request.finish()
+                return
 
-        name, event, other = match.groups()
-        if name == '' or event == '':
-            message = "Invalid request"
-            request.write("%s 404 Not found\r\nContent-Length: %d\r\n\r\n%s" % (
-                request.version, len(message), message))
-            request.finish()
-            return
-
-        # Drop from query appname and event's name
-        if not other.startswith('/'):
-            other = "/%s" % other
-        request.uri = other
-        request.path = other.partition("?")[0]
+            # Drop from query appname and event's name
+            if not other.startswith('/'):
+                other = "/%s" % other
+            request.uri = other
+            request.path = other.partition("?")[0]
 
         s = self.get_service(name)
         if s is None:

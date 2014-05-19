@@ -316,7 +316,7 @@ def handle_request(request):
             request.version, len(message), message))
         request.finish()
         return
-        
+
     process(request, s, event, pack_httprequest(request))
 
 
