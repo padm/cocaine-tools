@@ -183,7 +183,7 @@ class CocaineProxy(object):
             message = "application error: %s" % str(err)
             code = 502
         except TimeoutError as err:
-            self.logger.error("application %s timeouted out %s", service.name, err)
+            self.logger.error("application %s has timed out %s", service.name, err)
             message = "application %s timeout: %s" % (service.name, str(err))
             code = 502
         except ChokeEvent as err:
@@ -222,7 +222,7 @@ class CocaineProxy(object):
         except ServiceError as err:
             self.logger.error("application error: %s", err)
         except TimeoutError as err:
-            self.logger.error("application %s timeouted out %s", service.name, err)
+            self.logger.error("application %s has timed out %s", service.name, err)
         except Exception as err:
             self.logger.error("unknown error %s", err)
         finally:
