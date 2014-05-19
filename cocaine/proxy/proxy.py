@@ -27,8 +27,10 @@ import functools
 
 import msgpack
 import signal
+
 import tornado.httpserver
 import tornado.options
+from tornado import httputil
 from tornado import ioloop
 
 from cocaine.services import Service
@@ -56,7 +58,7 @@ dying = collections.defaultdict(list)  # application, which are waiting for reco
 
 
 class CocaineProxy(object):
-    TEMPLATE = "%(VERSION)s %(CODE)d %(STATUS)s\r\n%(HEADERS)s\r\n%(BODY)s"
+    TEMPLATE = "%(VERSION)s %(CODE)d %(STATUS)s\r\n%(HEADERS)s\r\n\r\n%(BODY)s"
 
     def __init__(self, port=8080, cache=DEFAULT_SERVICE_CACHE_COUNT, **config):
         self.port = port
@@ -165,56 +167,66 @@ class CocaineProxy(object):
                 return None
 
     @chain.source
-    def process(self, obj, service, event, data):
-        message_parts = []
+    def process(self, response, service, event, data):
+        # handle headers and body
+        headers = httputil.HTTPHeaders()
+        message = ""
+        code = 200
+        is_ok = False
         try:
-            chunk = yield service.enqueue(event, msgpack.packb(data), timeout=self.get_timeout(service.name))
-            while True:
-                body = yield
-                message_parts.append(str(body))
-        except ChokeEvent as err:
-            message = ''.join(message_parts)
-            headers_from_app = '\r\n'.join(': '.join(_) for _ in chunk[1])
-            if headers_from_app:
-                headers = headers_from_app + '\r\nContent-Length: %d\r\n' % len(message)
-            else:
-                headers = 'Content-Length: %d\r\n' % len(message)
-            response_data = self.TEMPLATE % {
-                "VERSION": obj.version,
-                "CODE": chunk[0],
-                "STATUS": httplib.responses[chunk[0]],
-                "HEADERS": headers,
-                "BODY": message}
+            code, raw_headers = yield service.enqueue(event, msgpack.packb(data), timeout=self.get_timeout(service.name))
+            for header, value in raw_headers:
+                headers.add(header, value)
+            is_ok = True
         except ServiceError as err:
             self.logger.error(str(err))
-            message = "Application error: %s" % str(err)
-            response_data = self.TEMPLATE % {
-                "VERSION": obj.version,
-                "CODE": 502,
-                "STATUS": httplib.responses[502],
-                "HEADERS": 'Content-Length: %d\r\n' % len(message),
-                "BODY": message}
+            message = "application error: %s" % str(err)
+            code = 502
         except TimeoutError as err:
-            self.logger.error("Application %s timeout %s", service.name, str(err))
-            message = "Application %s timeout: %s" % (service.name, str(err))
-            response_data = self.TEMPLATE % {
-                "VERSION": obj.version,
-                "CODE": 502,
-                "STATUS": httplib.responses[502],
-                "HEADERS": 'Content-Length: %d\r\n' % len(message),
-                "BODY": message}
+            self.logger.error("application %s timeouted out %s", service.name, err)
+            message = "application %s timeout: %s" % (service.name, str(err))
+            code = 502
+        except ChokeEvent as err:
+            self.logger.error("%s stream has been closed unexpectedly", service.name)
+            message = "astream has been closed unexpectedly"
+            code = 502
         except Exception as err:
-            self.logger.error(err)
-            message = "Unknown error: %s" % str(err)
-            response_data = self.TEMPLATE % {
-                "VERSION": obj.version,
-                "CODE": 502,
-                "STATUS": httplib.responses[502],
-                "HEADERS": 'Content-Length: %d\r\n' % len(message),
-                "BODY": message}
-        if obj._finish_time is None:
-            obj.write(response_data)
-            obj.finish()
+            self.logger.error("unknown error %s", err)
+            message = "unknown error: %s" % str(err)
+            code = 502
+
+        # in case of error
+        if not is_ok:
+            headers.add("Content-Length", len(message))
+
+        response_data = self.TEMPLATE % {
+            "VERSION": response.version,
+            "CODE": code,
+            "STATUS": httplib.responses[code],
+            "HEADERS": '\r\n'.join(("%s: %s" % (k, v) for k, v in headers.get_all())),
+            "BODY": message}
+        response.write(response_data)
+
+        # in case of error
+        if not is_ok:
+            response.finish()
+            return
+
+        # handle chunks
+        try:
+            while True:
+                body = yield
+                response.write(body)
+        except ChokeEvent as err:
+            pass
+        except ServiceError as err:
+            self.logger.error("application error: %s", err)
+        except TimeoutError as err:
+            self.logger.error("application %s timeouted out %s", service.name, err)
+        except Exception as err:
+            self.logger.error("unknown error %s", err)
+        finally:
+            response.finish()
 
     def pack_httprequest(self, request):
         headers = [(item.key, item.value) for item in request.cookies.itervalues()]
