@@ -177,6 +177,10 @@ class CocaineProxy(object):
             code, raw_headers = yield service.enqueue(event, msgpack.packb(data), timeout=self.get_timeout(service.name))
             for header, value in raw_headers:
                 headers.add(header, value)
+
+            # set up chunked encoding explicitly
+            if "Content-Length" not in headers and "Transfer-Encoding" not in headers:
+                headers.add("Transfer-Encoding", "chunked")
             is_ok = True
         except ServiceError as err:
             self.logger.error(str(err))
