@@ -181,6 +181,8 @@ class CocaineProxy(object):
             # set up chunked encoding explicitly
             if "Content-Length" not in headers and "Transfer-Encoding" not in headers:
                 headers.add("Transfer-Encoding", "chunked")
+
+            headers.add("X-Powered-By", "Cocaine")
             is_ok = True
         except ServiceError as err:
             self.logger.error(str(err))
